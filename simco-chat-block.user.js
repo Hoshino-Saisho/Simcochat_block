@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sim Companies 聊天室屏蔽
 // @namespace    https://github.com/
-// @version      3.2.0
+// @version      3.3.0
 // @description  在游戏聊天室里屏蔽指定玩家：他发的消息不显示。只在聊天室生效，不采集、不上传、完全不联网。
 // @author       -
 // @match        https://www.simcompanies.com/*
@@ -43,6 +43,21 @@
 //    往上找出"一条消息"是哪一层、名字在里面怎么取，把这份"配方"记下来。
 //    配方失效时面板会直接报出来，而不是安安静静地不干活。
 //
+// ----------------------------------------------------------------------------
+// 3.3.0 修的：屏蔽多个人时，部分人又漏出来
+// ----------------------------------------------------------------------------
+// 认法（配方）从【一份】改成【一组】，最多 8 套，每次点选只往上加、不覆盖。
+//
+// 原因：聊天里不同玩家的名字元素 class 可能不一样（赞助者、版主、带认证的，
+// 在 styled-components 下就是不同类名）。3.2.0 点选时是 setRecipe(新的) ——
+// 直接覆盖：
+//      选了 A → nameSel = a.名字-普通      A 挡住了
+//      选了 B → nameSel = a.名字-赞助者    A 的行从此读不出名字
+//                                          → 走"接上一条"→ 名字变成别人的
+//                                          → A 不再被屏蔽
+// 而自检只验刚点的那个人找得到，所以覆盖是【静默】的：A 还在名单里，
+// 「挡了」变成 0，看起来就像"这人最近没说话"。选的人越多塌得越厉害。
+//
 (function () {
   'use strict';
 
@@ -50,13 +65,63 @@
   // 存储
   // ==========================================================================
   const K_BLOCK = 'blocklist';     // [{ name, at }]
-  const K_RECIPE = 'recipe';       // { rowSel, nameSel, rootSel, learnedAt }
+  const K_RECIPES = 'recipes';     // [{ rowSel, nameSel, rootSel, at }]
+  const K_RECIPE = 'recipe';       // 3.2.0 及以前的单份配方，只用来迁移
   const K_UI = 'ui_collapsed';
+  const MAX_RECIPES = 8;
 
   const getBlock = () => GM_getValue(K_BLOCK, []);
   const setBlock = (v) => GM_setValue(K_BLOCK, v);
-  const getRecipe = () => GM_getValue(K_RECIPE, null);
-  const setRecipe = (v) => GM_setValue(K_RECIPE, v);
+
+  /**
+   * ⚠️⚠️ 认法是【一组】，不是一份。这是 3.3.0 修的那个严重 bug 的核心。
+   *
+   *    3.2.0 是 `setRecipe(新的)` —— **直接覆盖**。
+   *    而聊天里不同玩家的名字元素 class 可能不一样（赞助者、版主、带认证的
+   *    在 styled-components 下就是不同的类名）。于是：
+   *
+   *      选了 A → nameSel = a.名字-普通      A 挡住了
+   *      选了 B → nameSel = a.名字-赞助者    **A 的行从此读不出名字**
+   *                                          → 走"继承上一条" → 名字变成别人的
+   *                                          → A 不再被屏蔽
+   *
+   *    而 learnFrom 的自检只验"刚点的这个人找得到"，所以覆盖是**静默**的：
+   *    面板上 A 还在名单里，「挡了 N」变成 0，看起来就像"这人最近没说话"。
+   *    **选的人越多，塌得越厉害** —— 这正是你看到的现象。
+   *
+   *    现在每选一次就往这一组里【加】一条，读消息时每一条都试。
+   */
+  function getRecipes() {
+    let list = GM_getValue(K_RECIPES, null);
+    if (!list) {
+      // 从 3.2.0 那份单配方迁移过来，别让老用户回到"一条都不认识"
+      const one = GM_getValue(K_RECIPE, null);
+      list = one && one.rowSel ? [one] : [];
+      if (list.length) GM_setValue(K_RECIPES, list);
+    }
+    return list;
+  }
+  function addRecipe(r) {
+    const list = getRecipes();
+    const same = (a, b) => a.rowSel === b.rowSel && a.nameSel === b.nameSel &&
+                           (a.rootSel || '') === (b.rootSel || '');
+    if (list.some((x) => same(x, r))) return { list, added: false, dup: true };
+    // 新的排前面：常用的那几种先试，省一点点
+    const all = [Object.assign({ at: Date.now() }, r)].concat(list);
+    const next = all.slice(0, MAX_RECIPES);
+    GM_setValue(K_RECIPES, next);
+    // ⚠️ 挤掉旧的要说出来 —— 被挤掉的那一套对应的玩家会重新漏出来，
+    //    不吭声的话又变成"选的人越多越不灵"，和这次修的 bug 一模一样。
+    return { list: next, added: true, dropped: all.length - next.length };
+  }
+  function setRecipes(v) { GM_setValue(K_RECIPES, v || []); }
+  /*
+   * 单数形式只留给自测用（"就一套认法"那些用例写起来省事）。
+   * ⚠️ 正文里【一处都不许再调】—— 调了就等于又回到覆盖式，
+   *    而这正是 3.3.0 修的那个 bug。（自测 12b 直接扫源码钉这件事。）
+   */
+  const getRecipe = () => getRecipes()[0] || null;
+  const setRecipe = (v) => setRecipes(v ? [v] : []);
 
   /**
    * 名字归一化：去掉首尾空白、把连续空白压成一个、转小写。
@@ -86,7 +151,7 @@
   }
   /** class 里可能有 CSS 选择器的特殊字符，转义掉。 */
   function cssEsc(s) {
-    return String(s).replace(/[^a-zA-Z0-9_ -￿-]/g, (c) => '\\' + c);
+    return String(s).replace(/[^a-zA-Z0-9_ -￿-]/g, (c) => '\\' + c);
   }
 
   /** 兄弟里有几个"长得一样"的（同标签 + 同 class）。 */
@@ -134,16 +199,33 @@
     const rootSel = selOf(row.parentElement);
     const recipe = { rowSel, nameSel, rootSel, learnedAt: Date.now() };
 
-    // ---- 自检 ----
+    // ---- 自检 1：这一套自己认不认得出刚点的人 ----
     const probe = readRows(recipe);
     if (probe.err) return { err: '学完自检没过：' + probe.err };
     if (!probe.rows.length) return { err: '学完自检没过：按学到的选择器一条消息都找不到' };
-    const hit = probe.rows.some((r) => norm(r.name) === norm(text));
-    if (!hit) {
+    const found = (p) => p.rows && p.rows.some((r) => norm(r.name) === norm(text));
+    if (!found(probe)) {
       return { err: '学完自检没过：找得到 ' + probe.rows.length +
                     ' 条消息，但里面没有刚点的「' + text + '」—— 名字的位置认错了' };
     }
-    return { recipe, name: text, rows: probe.rows.length };
+
+    /*
+     * ---- 自检 2：和【已有的那几套】放在一起还认不认得出 ----
+     *
+     * ⚠️ 真正跑起来的是"所有认法的并集"，不是刚学的这一套。
+     *    只验单独一套的话，验过的东西和实际跑的东西不是一回事 ——
+     *    而这正是 3.2.0 那个 bug 的形状（自检只管刚点的人，覆盖是静默的）。
+     *
+     *    并集会出问题的唯一情形，是旧认法里某个 rowSel 恰好框住了更外面一层
+     *    （那样真正的消息行会被当成"行里的东西"整个吞掉）。真碰上了就
+     *    只留新的这一套，并且【吵出来】—— 而不是存一份验都没验过的进去。
+     */
+    const union = readRows(getRecipes().concat([recipe]));
+    if (union.err || !found(union)) {
+      return { recipe, name: text, rows: probe.rows.length, lonely: true,
+               why: union.err || '和已有的认法放在一起就找不到「' + text + '」了' };
+    }
+    return { recipe, name: text, rows: union.rows.length };
   }
 
   /**
@@ -162,9 +244,28 @@
    * ⚠️ 继承只在【同一个父节点里】延续。跨容器还接着用的话，
    *    上一个聊天框最后一个人的名字会漏到下一个框的开头去。
    */
-  function readRows(recipe) {
-    const empty = { rows: [], seen: 0, named: 0, inherited: 0 };
-    if (!recipe || !recipe.rowSel) return Object.assign({ err: '还没学过结构' }, empty);
+  function readRows(recipes) {
+    const empty = { rows: [], seen: 0, named: 0, inherited: 0, sets: 0 };
+    // 传一套也行，传一组也行 —— 自检那边就是传一套
+    const list = (Array.isArray(recipes) ? recipes : (recipes ? [recipes] : []))
+      .filter((r) => r && r.rowSel);
+    if (!list.length) return Object.assign({ err: '还没学过结构' }, empty);
+
+    const uniq = (a) => a.filter((x, i) => x && a.indexOf(x) === i);
+    const rowSels = uniq(list.map((r) => r.rowSel));
+    const nameSels = uniq(list.map((r) => r.nameSel));
+    const rootSels = uniq(list.map((r) => (r.rootSel && /\./.test(r.rootSel)) ? r.rootSel : ''));
+
+    /*
+     * ⚠️ 选择器先【单独验一遍】，不要等到用的时候才炸。
+     *    一组里只要有一个不合法，下面 matches() 会在遍历中途抛出来，
+     *    catch 在循环里的话就成了"这一条不算"—— 结果是安安静静少认一批行。
+     */
+    for (const s of rowSels.concat(nameSels).concat(rootSels)) {
+      try { document.querySelector(s); }
+      catch (e) { return Object.assign({ err: '选择器不合法：' + e.message }, empty); }
+    }
+
     /*
      * ⚠️ 先找【学到的那个容器】，再在容器里面找消息 —— 不在整个文档里瞎找。
      *
@@ -172,30 +273,66 @@
      *    在整个文档里找的话，撞上的那些行会一起被扫进来：
      *    「看到 N 条」凭空变大，更糟的是名字对上了就把页面别处的东西也藏了。
      *
-     *    容器没 class（选择器只剩个 div）时退回全文档找 —— 那种情况下
-     *    限定范围反而会把真正的聊天也框掉。面板上会写明是哪一种。
+     *    一组认法里只要有一套带容器，就按容器限定 —— 限得住就别放开。
+     *    全都没有容器 class 时才退回全文档；那种情况下限定范围反而会把
+     *    真正的聊天也框掉。面板上会写明是哪一种。
      */
-    let all;
-    try {
-      const scoped = recipe.rootSel && /\./.test(recipe.rootSel);
-      if (scoped) {
-        all = [];
-        for (const box of Array.from(document.querySelectorAll(recipe.rootSel))) {
-          all = all.concat(Array.from(box.querySelectorAll(recipe.rowSel)));
+    let boxes = [];
+    const scoped = rootSels.length > 0;
+    if (scoped) {
+      for (const rs of rootSels) {
+        for (const b of Array.from(document.querySelectorAll(rs))) {
+          if (boxes.indexOf(b) < 0) boxes.push(b);
         }
-      } else {
-        all = Array.from(document.querySelectorAll(recipe.rowSel));
       }
-    } catch (e) {
-      return Object.assign({ err: '选择器不合法：' + e.message }, empty);
+    } else {
+      boxes = document.body ? [document.body] : [];
     }
+
+    /*
+     * ⚠️⚠️ 行是【所有 rowSel 的并集】，而且按文档顺序 —— 顺序不能乱。
+     *
+     *    名字继承是"接着上一条"，顺序一错，没名字的行就会接到错的人身上。
+     *    所以这里自己按 children 往下走（走出来天然是文档顺序），
+     *    而不是各 selector 各查一遍再拼 —— 拼出来是"先第一套的全部、
+     *    再第二套的全部"，交错的行全串位，而它看起来完全正常。
+     *
+     * ⚠️ 认出是一行就【不再往里走】。两套 rowSel 一里一外都命中的话，
+     *    外面那层会把里面的真消息整个吞掉；不往里走等于"最外层的那个算一行"，
+     *    至少是一致的，而且不会同一条消息数两遍。
+     */
+    const all = [];
+    const hitsRow = (el) => {
+      for (const s of rowSels) { if (el.matches && el.matches(s)) return true; }
+      return false;
+    };
+    const walk = (n) => {
+      for (const c of Array.from(n.children || [])) {
+        if (hitsRow(c)) { if (all.indexOf(c) < 0) all.push(c); }
+        else walk(c);
+      }
+    };
+    for (const b of boxes) walk(b);
+
+    /*
+     * ⚠️⚠️ 每一行把【每一套 nameSel 都试一遍】，第一个读出字的算数。
+     *
+     *    这就是 3.3.0 修的那个 bug 的另一半：不同玩家的名字元素 class 可能不同
+     *    （赞助者 / 版主 / 带认证的在 styled-components 下就是不同类名）。
+     *    只用一套的话，另一批人的行读不出名字 → 走"继承上一条" →
+     *    名字变成别人的 → 那批人再也挡不住，而面板上他们还在名单里。
+     */
     const rows = [];
     let named = 0, inherited = 0, lastName = '', lastParent = null;
     for (const el of all) {
       if (el.parentElement !== lastParent) { lastName = ''; lastParent = el.parentElement; }
-      let ne = null;
-      try { ne = el.querySelector(recipe.nameSel); } catch (e) { /* 下面统一报 */ }
-      const txt = ne ? String(ne.textContent || '').trim() : '';
+      let txt = '';
+      for (const s of nameSels) {
+        let ne = null;
+        try { ne = el.querySelector(s); } catch (e) { /* 上面已验过，这里不该到 */ }
+        const t = ne ? String(ne.textContent || '').trim() : '';
+        if (t) { txt = t; break; }
+      }
       if (txt) {
         named++; lastName = txt;
         rows.push({ el, name: txt, inherited: false });
@@ -204,14 +341,30 @@
         rows.push({ el, name: lastName, inherited: true });
       }
     }
-    return { rows, seen: all.length, named, inherited };
+    return { rows, seen: all.length, named, inherited, scoped, sets: list.length };
   }
 
   // ==========================================================================
   // 屏蔽
   // ==========================================================================
   const MARK = 'scbHidden';        // dataset 上的标记
-  let LAST = { hidden: 0, seen: 0, named: 0, inherited: 0, perName: {}, err: null };
+  let LAST = { hidden: 0, seen: 0, named: 0, inherited: 0, perName: {}, err: null, sets: 0 };
+
+  /**
+   * 这一趟被我们藏起来的那些节点。
+   *
+   * ⚠️ 光靠"每趟把不匹配的放回去"是不够的：那只覆盖【这一趟还认得出来的行】。
+   *    认法一变（换了 rowSel、或者容器换了），上一趟藏起来的行这一趟根本
+   *    不在名单里 —— 于是它永远是 display:none，而且不属于任何人，
+   *    翻遍面板也看不出为什么那儿缺了一块。
+   *    所以自己记一份，每趟扫尾把"这趟没再看见的"放回去。
+   *    放回去的同时从集合里删掉，所以这个集合只装"当前正藏着的"，不会越攒越多。
+   */
+  let HIDDEN = new Set();
+  function show(el) {
+    if (el.dataset[MARK] === '1') { delete el.dataset[MARK]; el.style.display = ''; return true; }
+    return false;
+  }
 
   /**
    * 跑一遍：该藏的藏起来，不该藏的放回去。
@@ -224,11 +377,13 @@
    *    取消屏蔽之后旧消息永远不回来，你会以为取消没生效。
    */
   function apply() {
-    const recipe = getRecipe();
-    if (!recipe) { LAST = { hidden: 0, seen: 0, named: 0, inherited: 0, perName: {}, err: null }; return LAST; }
+    const recipes = getRecipes();
+    const blank = (err) => ({ hidden: 0, seen: 0, named: 0, inherited: 0, perName: {},
+                              err: err || null, sets: recipes.length });
+    if (!recipes.length) { LAST = blank(); return LAST; }
 
-    const r = readRows(recipe);
-    if (r.err) { LAST = { hidden: 0, seen: 0, named: 0, inherited: 0, perName: {}, err: r.err }; return LAST; }
+    const r = readRows(recipes);
+    if (r.err) { LAST = blank(r.err); return LAST; }
 
     /*
      * ⚠️ 配方失效的判据是**一条名字都读不出来**，不是"读出来的比例低"。
@@ -244,33 +399,42 @@
             '游戏大概改版了。点「＋ 屏蔽一个人」再点一次那个人的名字就好。';
     }
 
+    /*
+     * ⚠️ 名单读【一次】。原来是每行都调 isBlocked()，而 isBlocked 里面又
+     *    getBlock() 一次 —— 一屏两百行就是两百次反序列化 GM 存储，
+     *    而这个函数每 250ms 跑一遍。
+     */
+    const wanted = getBlock().map((b) => norm(b.name)).filter(Boolean);
     const perName = {};
+    const nowHidden = new Set();
     let hidden = 0;
     for (const { el, name } of r.rows) {
-      const block = !err && isBlocked(name);
+      const k = norm(name);
+      const block = !err && !!k && wanted.indexOf(k) >= 0;
       if (block) {
         if (el.dataset[MARK] !== '1') { el.dataset[MARK] = '1'; el.style.display = 'none'; }
+        nowHidden.add(el);
         hidden++;
-        const k = norm(name);
         perName[k] = (perName[k] || 0) + 1;
-      } else if (el.dataset[MARK] === '1') {
-        delete el.dataset[MARK];
-        el.style.display = '';
-      }
+      } else show(el);
     }
-    LAST = { hidden, seen: r.seen, named: r.named, inherited: r.inherited, perName, err };
+    // 扫尾：上一趟藏了、这一趟压根没再看见的，放回去（见 HIDDEN 那段）
+    for (const el of Array.from(HIDDEN)) if (!nowHidden.has(el)) show(el);
+    HIDDEN = nowHidden;
+
+    LAST = { hidden, seen: r.seen, named: r.named, inherited: r.inherited,
+             perName, err, sets: r.sets };
     return LAST;
   }
 
   /** 取消屏蔽 / 卸载时，把藏起来的全放回来。 */
   function unhideAll() {
-    const recipe = getRecipe();
-    if (!recipe) return 0;
     let n = 0;
-    const r = readRows(recipe);
-    for (const { el } of r.rows) {
-      if (el.dataset[MARK] === '1') { delete el.dataset[MARK]; el.style.display = ''; n++; }
-    }
+    for (const el of Array.from(HIDDEN)) if (show(el)) n++;
+    HIDDEN = new Set();
+    // 再按当前认法扫一遍，捞回不在集合里的（比如脚本重载前那一轮藏的）
+    const r = readRows(getRecipes());
+    for (const { el } of (r.rows || [])) if (show(el)) n++;
     return n;
   }
 
@@ -323,11 +487,28 @@
 
     /*
      * 每次点选都【顺带把结构重认一遍】—— 所以没有单独的"学结构"按钮。
-     * 游戏改版之后，你照常点一次那个人的名字，配方自己就更新了。
+     * 游戏改版之后，你照常点一次那个人的名字，认法自己就更新了。
+     *
+     * ⚠️⚠️ 是【往上加】，不是覆盖。3.2.0 这里写的是 setRecipe(…) ——
+     *      选第二个人时如果他的名字元素 class 和第一个人不一样，
+     *      第一个人的认法就被换掉了，他的行从此读不出名字、
+     *      走"继承上一条"、名字变成别人的、于是不再被屏蔽。
+     *      而面板上他还在名单里，「挡了」变成 0，看起来就像"这人最近没说话"。
+     *      **选的人越多塌得越厉害** —— 这就是你报的那个 bug。
      */
-    setRecipe(res.recipe);
+    if (res.lonely) {
+      setRecipes([res.recipe]);
+      log('warn', '已有的认法和这一套冲突（' + res.why + '），只留了新的这一套 —— ' +
+                  '名单里其他人可能要再点一次名字');
+    } else {
+      const add = addRecipe(res.recipe);
+      if (add.dropped) {
+        log('warn', '认法最多存 ' + MAX_RECIPES + ' 套，挤掉了最旧的 ' + add.dropped +
+                    ' 套 —— 对应那些人可能要再点一次名字');
+      }
+    }
     log('info', '认出：一条消息 = ' + res.recipe.rowSel + '　名字 = ' + res.recipe.nameSel +
-                '（当前 ' + res.rows + ' 条）');
+                '（认法 ' + getRecipes().length + ' 套 · 当前 ' + res.rows + ' 条）');
     const a = addBlock(res.name);
     log(a.err ? 'warn' : 'info', a.err || ('已屏蔽「' + a.name + '」'));
     apply(); refresh(true);
@@ -442,12 +623,18 @@
 
   /** 状态那一行怎么说。三种"没生效"必须分开，见说明。 */
   function stateLine() {
-    if (!getRecipe()) return ['还没屏蔽过谁 —— 点下面那个按钮，再点聊天里的名字', '#fc6'];
+    if (!getRecipes().length) return ['还没屏蔽过谁 —— 点下面那个按钮，再点聊天里的名字', '#fc6'];
     if (LAST.err) return ['⚠️ ' + LAST.err, '#f7a'];
     if (LAST.seen === 0) return ['现在页面上没有聊天（不在聊天室）', '#9aa'];
+    /*
+     * ⚠️ 认法有几套要【写出来】。不同玩家的名字元素 class 可能不一样，
+     *    多存几套正是 3.3.0 修的那件事 —— 写出来你才能确认它真的在用多套，
+     *    而不是又悄悄退回一套。
+     */
     return ['生效中 · 看到 ' + LAST.seen + ' 条' +
             (LAST.inherited ? '（' + LAST.inherited + ' 条接上一条的名字）' : '') +
-            ' · 挡掉 ' + LAST.hidden + ' 条', '#8fd'];
+            ' · 挡掉 ' + LAST.hidden + ' 条' +
+            (LAST.sets > 1 ? ' · 认法 ' + LAST.sets + ' 套' : ''), '#8fd'];
   }
 
   /**
@@ -610,8 +797,9 @@
   // 仅供 Node 下的离线自测使用；浏览器里 module 未定义，这行是死代码。
   if (typeof module !== 'undefined' && module.exports)
     module.exports = { norm, isBlocked, addBlock, removeBlock, getBlock, setBlock,
-                       getRecipe, setRecipe, learnFrom, readRows, apply, unhideAll,
-                       selOf, alikeSiblings, K_BLOCK, K_RECIPE,
+                       getRecipe, setRecipe, getRecipes, setRecipes, addRecipe,
+                       learnFrom, readRows, apply, unhideAll,
+                       selOf, alikeSiblings, K_BLOCK, K_RECIPE, K_RECIPES, MAX_RECIPES,
                        buildUI, refresh, stateLine,
                        __ui: () => ({ panel: $panel, head: $head, body: $body,
                                       state: $state, rows: $rows, pick: $pick }),
@@ -619,3 +807,4 @@
                        __pick: (v) => { if (v !== undefined) picking = v; return picking; },
                        onPick, onKey };
 })();
+
